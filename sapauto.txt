@@ -1,0 +1,227 @@
+Option Explicit
+
+'========================
+' CONFIG (TU ARCHIVO)
+'========================
+Private Const SHEET_NAME As String = "Clearing GRIR 20206100"
+Private Const HEADER_TEXT_COMPANY As String = "Company"
+Private Const GL_ACCOUNT As String = "20206100"
+
+Public Sub Run_GRIR_F13_ToTodayColumn()
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    '1) Encontrar encabezados
+    Dim headerRow As Long: headerRow = FindHeaderRow(ws, HEADER_TEXT_COMPANY, 1, 80)
+    If headerRow = 0 Then
+        MsgBox "No encontré el encabezado 'Company' en la hoja '" & SHEET_NAME & "'.", vbCritical
+        Exit Sub
+    End If
+
+    Dim colCompany As Long: colCompany = FindHeaderCol(ws, headerRow, HEADER_TEXT_COMPANY, 1, 500)
+    If colCompany = 0 Then
+        MsgBox "No encontré la columna 'Company' en la fila " & headerRow & ".", vbCritical
+        Exit Sub
+    End If
+
+    '2) Columna de HOY (mm.dd.yyyy)
+    Dim todayHeader As String: todayHeader = Format(Date, "mm.dd.yyyy")
+    Dim colToday As Long
+    colToday = FindHeaderCol(ws, headerRow, todayHeader, colCompany + 1, 900)
+
+    If colToday = 0 Then
+        colToday = LastUsedCol(ws, headerRow, 1, 900) + 1
+        ws.Cells(headerRow, colToday).value = todayHeader
+    End If
+
+    '3) Conectar SAP
+    Dim sapGuiAuto As Object, application As Object, connection As Object, session As Object
+    If Not GetSapSession(sapGuiAuto, application, connection, session) Then
+        MsgBox "No pude conectarme a SAP GUI. Abre SAP e inicia sesión antes de correr la macro.", vbCritical
+        Exit Sub
+    End If
+
+    Dim lastRow As Long: lastRow = LastUsedRow(ws, colCompany, headerRow + 1, 20000)
+
+    Dim r As Long
+    For r = headerRow + 1 To lastRow
+        Dim company As String
+        company = Trim$(CStr(ws.Cells(r, colCompany).value))
+        If company = vbNullString Then GoTo NextRow
+
+        'Si ya hay resultado hoy, no reprocesar
+        If Trim$(CStr(ws.Cells(r, colToday).value)) <> vbNullString Then GoTo NextRow
+
+        On Error GoTo RowFail
+
+        Dim statusText As String
+        statusText = RunF13_FullCycle(session, company, Year(Date), GL_ACCOUNT)
+
+        If Len(Trim$(statusText)) = 0 Then statusText = "N/A"
+        ws.Cells(r, colToday).value = statusText
+
+        GoTo NextRow
+
+RowFail:
+        ws.Cells(r, colToday).value = "ERROR: " & Err.Number & " - " & Err.Description
+        Err.Clear
+
+NextRow:
+        On Error GoTo 0
+        DoEvents
+    Next r
+
+    MsgBox "Listo. Actualizado en la columna " & todayHeader & ".", vbInformation
+End Sub
+
+'========================
+' SAP - PROCESO COMPLETO (según tu script)
+'========================
+Private Function RunF13_FullCycle(ByVal session As Object, ByVal company As String, ByVal fiscalYear As Long, ByVal glAccount As String) As String
+    On Error GoTo Fail
+
+    'Maximizar (opcional)
+    On Error Resume Next
+    session.findById("wnd[0]").maximize
+    On Error GoTo Fail
+
+    'Siempre reiniciar en F.13 para evitar que quede en otra pantalla
+    session.findById("wnd[0]/tbar[0]/okcd").Text = "/nF.13"
+    session.findById("wnd[0]").sendVKey 0
+    WaitGui 400
+
+    'Set flags
+    session.findById("wnd[0]/usr/chkX_SAKNR").Selected = True    'Select G/L accounts
+    session.findById("wnd[0]/usr/chkX_TESTL").Selected = False   'Real run (no test)
+
+    'Campos
+    session.findById("wnd[0]/usr/ctxtBUKRX-LOW").Text = company
+    session.findById("wnd[0]/usr/txtGJAHX-LOW").Text = CStr(fiscalYear)
+    session.findById("wnd[0]/usr/ctxtKONTS-LOW").Text = glAccount
+
+    'Execute (F8)
+    session.findById("wnd[0]/tbar[1]/btn[8]").Press
+    WaitGui 700
+
+    'Leer mensaje
+    Dim msg As String
+    msg = GetStatusBarTextSafe(session, 25)
+
+    'Si pide confirmación "production run", Enter y volver a leer
+    If InStr(1, msg, "production run", vbTextCompare) > 0 Then
+        session.findById("wnd[0]").sendVKey 0
+        WaitGui 500
+        msg = GetStatusBarTextSafe(session, 25)
+    Else
+        'Tu script hace Enter sí o sí; lo hacemos tolerante
+        session.findById("wnd[0]").sendVKey 0
+        WaitGui 250
+        Dim afterEnter As String
+        afterEnter = GetStatusBarTextSafe(session, 10)
+        If Len(Trim$(afterEnter)) > 0 Then msg = afterEnter
+    End If
+
+    'No necesitamos doubleClick en sbar para capturar el doc,
+    'pero si tu SAP cambia el mensaje solo después del doubleClick,
+    'lo intentamos sin romper si no existe.
+    On Error Resume Next
+    session.findById("wnd[0]/sbar").DoubleClick
+    On Error GoTo 0
+    WaitGui 200
+
+    'Back (btn[3]) para volver listo al siguiente
+    On Error Resume Next
+    session.findById("wnd[0]/tbar[0]/btn[3]").Press
+    On Error GoTo 0
+    WaitGui 250
+
+    RunF13_FullCycle = msg
+    Exit Function
+
+Fail:
+    RunF13_FullCycle = "ERROR: " & Err.Number & " - " & Err.Description
+End Function
+
+Private Function GetStatusBarTextSafe(ByVal session As Object, ByVal retries As Integer) As String
+    Dim i As Integer
+    For i = 1 To retries
+        On Error Resume Next
+        Dim t As String
+        t = CStr(session.findById("wnd[0]/sbar").Text)
+        On Error GoTo 0
+
+        If Len(Trim$(t)) > 0 Then
+            GetStatusBarTextSafe = t
+            Exit Function
+        End If
+
+        WaitGui 150
+        DoEvents
+    Next i
+    GetStatusBarTextSafe = ""
+End Function
+
+'========================
+' SAP CONNECT
+'========================
+Private Function GetSapSession(ByRef sapGuiAuto As Object, ByRef application As Object, ByRef connection As Object, ByRef session As Object) As Boolean
+    On Error GoTo Fail
+    Set sapGuiAuto = GetObject("SAPGUI")
+    Set application = sapGuiAuto.GetScriptingEngine
+    If application.Connections.Count = 0 Then GoTo Fail
+    Set connection = application.Children(0)
+    If connection.Sessions.Count = 0 Then GoTo Fail
+    Set session = connection.Children(0)
+    GetSapSession = True
+    Exit Function
+Fail:
+    GetSapSession = False
+End Function
+
+Private Sub WaitGui(ByVal ms As Long)
+    Dim t As Double: t = Timer
+    Do While (Timer - t) * 1000# < ms
+        DoEvents
+    Loop
+End Sub
+
+'========================
+' EXCEL HELPERS
+'========================
+Private Function FindHeaderRow(ByVal ws As Worksheet, ByVal headerText As String, ByVal rStart As Long, ByVal rEnd As Long) As Long
+    Dim r As Long, c As Long
+    For r = rStart To rEnd
+        For c = 1 To 800
+            If Trim$(CStr(ws.Cells(r, c).value)) = headerText Then
+                FindHeaderRow = r
+                Exit Function
+            End If
+        Next c
+    Next r
+End Function
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal headerText As String, ByVal cStart As Long, ByVal cEnd As Long) As Long
+    Dim c As Long
+    For c = cStart To cEnd
+        If Trim$(CStr(ws.Cells(headerRow, c).value)) = headerText Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+Private Function LastUsedCol(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal cStart As Long, ByVal cEnd As Long) As Long
+    Dim c As Long, last As Long
+    For c = cStart To cEnd
+        If Len(Trim$(CStr(ws.Cells(rowNum, c).value))) > 0 Then last = c
+    Next c
+    LastUsedCol = last
+End Function
+
+Private Function LastUsedRow(ByVal ws As Worksheet, ByVal colNum As Long, ByVal rStart As Long, ByVal rEnd As Long) As Long
+    Dim r As Long, last As Long
+    For r = rStart To rEnd
+        If Len(Trim$(CStr(ws.Cells(r, colNum).value))) > 0 Then last = r
+    Next r
+    LastUsedRow = last
+End Function
+
